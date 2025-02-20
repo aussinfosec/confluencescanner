@@ -7,6 +7,7 @@ import os
 import subprocess
 import requests
 import tempfile
+import time
 from datetime import datetime
 
 def setup_logging(verbose):
@@ -51,6 +52,7 @@ class ConfluenceSecretScanner:
                 url = data.get("_links", {}).get("next")
                 if url:
                     url = f"{self.base_url}{url}"
+                time.sleep(0.5)  # Add delay to avoid rate limits
             except requests.RequestException as e:
                 self.logger.error(f"Failed to fetch spaces: {e}")
                 break
@@ -81,6 +83,7 @@ class ConfluenceSecretScanner:
                 url = data.get("_links", {}).get("next")
                 if url:
                     url = f"{self.base_url}{url}"
+                time.sleep(0.5)  # Add delay to avoid rate limits
                 params = None  # Clear params after first request
             except requests.RequestException as e:
                 self.logger.error(f"Failed to fetch {content_type} in space {space_key}: {e}")
@@ -100,6 +103,7 @@ class ConfluenceSecretScanner:
                 url = data.get("_links", {}).get("next")
                 if url:
                     url = f"{self.base_url}{url}"
+                time.sleep(0.5)  # Add delay to avoid rate limits
             except requests.RequestException as e:
                 self.logger.error(f"Failed to fetch comments for content {content_id}: {e}")
                 break
@@ -118,6 +122,7 @@ class ConfluenceSecretScanner:
                 url = data.get("_links", {}).get("next")
                 if url:
                     url = f"{self.base_url}{url}"
+                time.sleep(0.5)  # Add delay to avoid rate limits
             except requests.RequestException as e:
                 self.logger.error(f"Failed to fetch attachments for content {content_id}: {e}")
                 break
@@ -136,6 +141,9 @@ class ConfluenceSecretScanner:
 
     def download_attachment(self, attachment):
         """Download an attachment to a temporary file."""
+        if not attachment['title'].endswith(('.txt', '.pdf', '.docx', '.json')):
+            self.logger.debug(f"Skipping non-text attachment: {attachment['title']}")
+            return None
         download_url = f"{self.base_url}{attachment['_links']['download']}"
         temp_file = tempfile.NamedTemporaryFile(delete=False, dir=self.temp_dir.name)
         try:
@@ -216,10 +224,14 @@ class ConfluenceSecretScanner:
                     })
                     self._output_finding(finding)
 
-        # Scan comments
+        # Scan comments with error handling for missing 'body'
         comments = self.get_comments(content_id)
         for comment in comments:
-            comment_body = comment["body"]["storage"]["value"]
+            try:
+                comment_body = comment["body"]["storage"]["value"]
+            except KeyError as e:
+                self.logger.warning(f"Skipping comment {comment.get('id', 'unknown')} due to missing key: {e}")
+                continue
             for finding in self.scan_text(comment_body):
                 finding.update({
                     "space_key": space_key,
@@ -304,6 +316,7 @@ class ConfluenceSecretScanner:
             self.scan_space(space)
 
         self.logger.info("Scan completed.")
+        self.temp_dir.cleanup()
 
 def main():
     parser = argparse.ArgumentParser(
@@ -312,7 +325,7 @@ def main():
     parser.add_argument("--token", help="Confluence Personal Access Token")
     parser.add_argument("--url", help="Confluence base URL (e.g., https://mycompany.atlassian.net/wiki)")
     parser.add_argument("--trufflehog-path", default="trufflehog", help="Path to TruffleHog v3 binary")
-    parser.add_argument("--config", default="config.json", help="Path to config JSON file")
+    parser.add_argument("--config", help="Path to config JSON file", default=None)
     parser.add_argument("--output", help="Path to output file for findings in JSON format")
     parser.add_argument("--space-keys", nargs='+', help="Specify one or more Confluence space keys to scan (e.g., SPACE1 SPACE2)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
@@ -321,8 +334,11 @@ def main():
 
     setup_logging(args.verbose)
 
-    # Load config from file, override with CLI args if provided
-    config = load_config(args.config)
+    # Load config only if provided, otherwise rely on args/env
+    config = {}
+    if args.config:
+        config = load_config(args.config)
+
     token = args.token or config.get("token") or os.getenv("CONFLUENCE_USER_TOKEN")
     url = args.url or config.get("url")
     trufflehog_path = args.trufflehog_path or config.get("trufflehog_path", "trufflehog")
