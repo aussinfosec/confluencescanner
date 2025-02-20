@@ -7,14 +7,10 @@ import os
 import subprocess
 import requests
 import tempfile
+from datetime import datetime
 
 def setup_logging(verbose):
-    """
-    Configure logging based on verbosity level.
-
-    Args:
-        verbose (bool): If True, set logging to DEBUG; otherwise, INFO.
-    """
+    """Configure logging based on verbosity."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -22,15 +18,7 @@ def setup_logging(verbose):
     )
 
 def load_config(config_path):
-    """
-    Load configuration from a JSON file.
-
-    Args:
-        config_path (str): Path to the config file.
-
-    Returns:
-        dict: Configuration dictionary, or empty dict if loading fails.
-    """
+    """Load configuration from a JSON file."""
     try:
         with open(config_path, "r") as f:
             return json.load(f)
@@ -39,16 +27,8 @@ def load_config(config_path):
         return {}
 
 class ConfluenceSecretScanner:
-    def __init__(self, token, base_url, trufflehog_path="trufflehog", output_file=None):
-        """
-        Initialize the Confluence secret scanner.
-
-        Args:
-            token (str): Confluence Personal Access Token for authentication.
-            base_url (str): Base URL of the Confluence instance (e.g., https://mycompany.atlassian.net/wiki).
-            trufflehog_path (str): Path to the TruffleHog v3 binary.
-            output_file (file object, optional): File object to write JSON findings to.
-        """
+    def __init__(self, token, base_url, trufflehog_path="trufflehog", output_file=None, args=None):
+        """Initialize the Confluence secret scanner."""
         self.token = token
         self.base_url = base_url.rstrip('/')
         self.headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -56,101 +36,95 @@ class ConfluenceSecretScanner:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.logger = logging.getLogger(__name__)
         self.output_file = output_file
+        self.args = args
 
-    def fetch_all(self, url, params=None):
-        """
-        Fetch all results from a paginated Confluence API endpoint.
+    def get_spaces(self):
+        """Fetch all accessible spaces."""
+        url = f"{self.base_url}/rest/api/space"
+        spaces = []
+        while url:
+            try:
+                response = requests.get(url, headers=self.headers)
+                response.raise_for_status()
+                data = response.json()
+                spaces.extend(data["results"])
+                url = data.get("_links", {}).get("next")
+                if url:
+                    url = f"{self.base_url}{url}"
+            except requests.RequestException as e:
+                self.logger.error(f"Failed to fetch spaces: {e}")
+                break
+        return spaces
 
-        Args:
-            url (str): Initial API endpoint URL.
-            params (dict, optional): Query parameters for the first request.
+    def get_space_by_key(self, key):
+        """Fetch a specific space by its key."""
+        url = f"{self.base_url}/rest/api/space/{key}"
+        try:
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            self.logger.error(f"Failed to fetch space with key '{key}': {e}")
+            return None
 
-        Yields:
-            dict: Individual items from the API response.
-        """
+    def get_content_in_space(self, space_key, content_type):
+        """Fetch all content of a specific type in a space."""
+        url = f"{self.base_url}/rest/api/content"
+        params = {"spaceKey": space_key, "type": content_type, "expand": "body.storage,version"}
+        content = []
         while url:
             try:
                 response = requests.get(url, headers=self.headers, params=params)
                 response.raise_for_status()
                 data = response.json()
-                for item in data["results"]:
-                    yield item
-                url = data["_links"].get("next")
-                params = None  # Only use params for the first request
+                content.extend(data["results"])
+                url = data.get("_links", {}).get("next")
+                if url:
+                    url = f"{self.base_url}{url}"
+                params = None  # Clear params after first request
             except requests.RequestException as e:
-                self.logger.error(f"Failed to fetch from {url}: {e}")
+                self.logger.error(f"Failed to fetch {content_type} in space {space_key}: {e}")
                 break
-
-    def get_spaces(self):
-        """Fetch all accessible spaces, including their descriptions."""
-        url = f"{self.base_url}/rest/api/space?expand=description.plain"
-        return list(self.fetch_all(url))
-
-    def get_content_in_space(self, space_key, content_type):
-        """
-        Fetch all content of a specific type in a space.
-
-        Args:
-            space_key (str): Key of the space to scan.
-            content_type (str): Type of content ("page" or "blogpost").
-
-        Returns:
-            list: List of content items.
-        """
-        url = f"{self.base_url}/rest/api/content"
-        params = {"spaceKey": space_key, "type": content_type, "expand": "body.storage,version"}
-        return list(self.fetch_all(url, params))
+        return content
 
     def get_comments(self, content_id):
-        """
-        Fetch comments for a given content ID.
-
-        Args:
-            content_id (str): ID of the content (page or blog post).
-
-        Returns:
-            list: List of comment objects.
-        """
-        url = f"{self.base_url}/rest/api/content/{content_id}/child/comment?expand=body.storage"
-        return list(self.fetch_all(url))
+        """Fetch comments for a given content ID."""
+        url = f"{self.base_url}/rest/api/content/{content_id}/child/comment"
+        comments = []
+        while url:
+            try:
+                response = requests.get(url, headers=self.headers)
+                response.raise_for_status()
+                data = response.json()
+                comments.extend(data["results"])
+                url = data.get("_links", {}).get("next")
+                if url:
+                    url = f"{self.base_url}{url}"
+            except requests.RequestException as e:
+                self.logger.error(f"Failed to fetch comments for content {content_id}: {e}")
+                break
+        return comments
 
     def get_attachments(self, content_id):
-        """
-        Fetch attachments for a given content ID.
-
-        Args:
-            content_id (str): ID of the content (page or blog post).
-
-        Returns:
-            list: List of attachment objects.
-        """
+        """Fetch attachments for a given content ID."""
         url = f"{self.base_url}/rest/api/content/{content_id}/child/attachment"
-        return list(self.fetch_all(url))
-
-    def get_properties(self, content_id):
-        """
-        Fetch properties for a given content ID.
-
-        Args:
-            content_id (str): ID of the content (page or blog post).
-
-        Returns:
-            list: List of property objects.
-        """
-        url = f"{self.base_url}/rest/api/content/{content_id}/property"
-        return list(self.fetch_all(url))
+        attachments = []
+        while url:
+            try:
+                response = requests.get(url, headers=self.headers)
+                response.raise_for_status()
+                data = response.json()
+                attachments.extend(data["results"])
+                url = data.get("_links", {}).get("next")
+                if url:
+                    url = f"{self.base_url}{url}"
+            except requests.RequestException as e:
+                self.logger.error(f"Failed to fetch attachments for content {content_id}: {e}")
+                break
+        return attachments
 
     def get_version_content(self, content_id, version):
-        """
-        Fetch the content of a specific version of a page or blog post.
-
-        Args:
-            content_id (str): ID of the content.
-            version (int): Version number to fetch.
-
-        Returns:
-            str: Storage format content of the version.
-        """
+        """Fetch the content of a specific version of a page or blog post."""
         url = f"{self.base_url}/rest/api/content/{content_id}?version={version}&expand=body.storage"
         try:
             response = requests.get(url, headers=self.headers)
@@ -161,17 +135,9 @@ class ConfluenceSecretScanner:
             return ""
 
     def download_attachment(self, attachment):
-        """
-        Download an attachment to a temporary file.
-
-        Args:
-            attachment (dict): Attachment object from the API.
-
-        Returns:
-            str: Path to the downloaded file, or None if download fails.
-        """
-        temp_file = tempfile.NamedTemporaryFile(delete=False, dir=self.temp_dir.name)
+        """Download an attachment to a temporary file."""
         download_url = f"{self.base_url}{attachment['_links']['download']}"
+        temp_file = tempfile.NamedTemporaryFile(delete=False, dir=self.temp_dir.name)
         try:
             response = requests.get(download_url, headers=self.headers, stream=True)
             response.raise_for_status()
@@ -185,15 +151,7 @@ class ConfluenceSecretScanner:
             return None
 
     def scan_text(self, text):
-        """
-        Scan text content with TruffleHog v3.
-
-        Args:
-            text (str): Text content to scan.
-
-        Yields:
-            dict: TruffleHog findings.
-        """
+        """Scan text content with TruffleHog v3."""
         with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=self.temp_dir.name) as temp_file:
             temp_file.write(text)
             temp_file_path = temp_file.name
@@ -214,15 +172,7 @@ class ConfluenceSecretScanner:
             os.remove(temp_file_path)
 
     def scan_file(self, file_path):
-        """
-        Scan a file with TruffleHog v3.
-
-        Args:
-            file_path (str): Path to the file to scan.
-
-        Yields:
-            dict: TruffleHog findings.
-        """
+        """Scan a file with TruffleHog v3."""
         try:
             result = subprocess.run(
                 [self.trufflehog_path, "filesystem", file_path, "--json"],
@@ -238,41 +188,14 @@ class ConfluenceSecretScanner:
             self.logger.error(f"TruffleHog scan failed for file {file_path}: {e}")
 
     def get_content_url(self, content):
-        """
-        Get the full URL of a content item (page or blog post).
-
-        Args:
-            content (dict): Content object from the API.
-
-        Returns:
-            str: Full URL to the content.
-        """
+        """Get the full URL of a content item (page or blog post)."""
         relative_url = content["_links"]["webui"]
         return f"{self.base_url}{relative_url}"
 
-    def get_space_url(self, space):
-        """
-        Get the full URL of a space.
-
-        Args:
-            space (dict): Space object from the API.
-
-        Returns:
-            str: Full URL to the space.
-        """
-        relative_url = space["_links"]["webui"]
-        return f"{self.base_url}{relative_url}"
-
     def process_content(self, content, space_key):
-        """
-        Process a content item, scanning its versions, comments, attachments, and properties.
-
-        Args:
-            content (dict): Content object (page or blog post).
-            space_key (str): Key of the space containing the content.
-        """
+        """Process a content item, scanning its versions, comments, and attachments."""
         content_id = content["id"]
-        content_type = content["type"]  # "page" or "blogpost"
+        content_type = content["type"]
         title = content["title"]
         url = self.get_content_url(content)
 
@@ -324,27 +247,8 @@ class ConfluenceSecretScanner:
                     self._output_finding(finding)
                 os.remove(file_path)
 
-        # Scan properties
-        properties = self.get_properties(content_id)
-        for prop in properties:
-            prop_value = json.dumps(prop["value"])
-            for finding in self.scan_text(prop_value):
-                finding.update({
-                    "space_key": space_key,
-                    "content_type": "property",
-                    "property_key": prop["key"],
-                    "title": f"Property {prop['key']} on {title}",
-                    "url": url
-                })
-                self._output_finding(finding)
-
     def _output_finding(self, finding):
-        """
-        Output a finding to the console or file.
-
-        Args:
-            finding (dict): The finding to output.
-        """
+        """Output a finding to the console or file."""
         if self.output_file:
             self.output_file.write(json.dumps(finding) + "\n")
         else:
@@ -353,56 +257,71 @@ class ConfluenceSecretScanner:
                 f"in {finding['content_type']} '{finding['title']}' at {finding['url']}"
             )
 
+    def scan_space(self, space):
+        """Scan a single Confluence space for secrets."""
+        space_key = space["key"]
+        self.logger.info(f"Scanning space: {space_key}")
+
+        # Scan space description
+        description = space.get("description", {}).get("plain", {}).get("value", "")
+        if description:
+            for finding in self.scan_text(description):
+                finding.update({
+                    "space_key": space_key,
+                    "content_type": "space_description",
+                    "title": f"Description of space {space_key}",
+                    "url": f"{self.base_url}/spaces/{space_key}"
+                })
+                self._output_finding(finding)
+
+        # Scan pages
+        pages = self.get_content_in_space(space_key, "page")
+        for page in pages:
+            self.process_content(page, space_key)
+
+        # Scan blog posts
+        blogs = self.get_content_in_space(space_key, "blogpost")
+        for blog in blogs:
+            self.process_content(blog, space_key)
+
     def run(self):
-        """Run the secret scan across all accessible spaces and content types."""
-        self.logger.info("Starting Confluence secret scan...")
-        spaces = self.get_spaces()
-        if not spaces:
-            self.logger.warning("No spaces found or accessible.")
-            return
+        """Run the secret scan across all or specified spaces."""
+        if self.args.space_keys:
+            spaces_to_scan = []
+            for key in self.args.space_keys:
+                space = self.get_space_by_key(key)
+                if space:
+                    spaces_to_scan.append(space)
+                else:
+                    self.logger.error(f"Space with key '{key}' not found or inaccessible.")
+            if not spaces_to_scan:
+                self.logger.error("No valid spaces to scan. Exiting.")
+                return
+        else:
+            spaces_to_scan = self.get_spaces()
 
-        for space in spaces:
-            space_key = space["key"]
-            space_url = self.get_space_url(space)
-            self.logger.debug(f"Processing space {space_key}")
-
-            # Scan space description
-            description = space.get("description", {}).get("plain", {}).get("value", "")
-            if description:
-                for finding in self.scan_text(description):
-                    finding.update({
-                        "space_key": space_key,
-                        "content_type": "space_description",
-                        "title": f"Description of space {space_key}",
-                        "url": space_url
-                    })
-                    self._output_finding(finding)
-
-            # Scan pages and blog posts
-            for content_type in ["page", "blogpost"]:
-                contents = self.get_content_in_space(space_key, content_type)
-                for content in contents:
-                    self.process_content(content, space_key)
+        for space in spaces_to_scan:
+            self.scan_space(space)
 
         self.logger.info("Scan completed.")
-        self.temp_dir.cleanup()
 
 def main():
-    """Parse arguments and run the scanner."""
     parser = argparse.ArgumentParser(
-        description="Scan Confluence for secrets using TruffleHog v3."
+        description="ConfluenceSecretScanner: Scan Confluence for secrets using TruffleHog v3."
     )
     parser.add_argument("--token", help="Confluence Personal Access Token")
     parser.add_argument("--url", help="Confluence base URL (e.g., https://mycompany.atlassian.net/wiki)")
     parser.add_argument("--trufflehog-path", default="trufflehog", help="Path to TruffleHog v3 binary")
     parser.add_argument("--config", default="config.json", help="Path to config JSON file")
     parser.add_argument("--output", help="Path to output file for findings in JSON format")
+    parser.add_argument("--space-keys", nargs='+', help="Specify one or more Confluence space keys to scan (e.g., SPACE1 SPACE2)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+
     args = parser.parse_args()
 
     setup_logging(args.verbose)
 
-    # Load config from file, override with CLI args or env vars
+    # Load config from file, override with CLI args if provided
     config = load_config(args.config)
     token = args.token or config.get("token") or os.getenv("CONFLUENCE_USER_TOKEN")
     url = args.url or config.get("url")
@@ -417,10 +336,10 @@ def main():
 
     if args.output:
         with open(args.output, "w") as output_file:
-            scanner = ConfluenceSecretScanner(token, url, trufflehog_path, output_file)
+            scanner = ConfluenceSecretScanner(token, url, trufflehog_path, output_file, args)
             scanner.run()
     else:
-        scanner = ConfluenceSecretScanner(token, url, trufflehog_path)
+        scanner = ConfluenceSecretScanner(token, url, trufflehog_path, args=args)
         scanner.run()
 
 if __name__ == "__main__":
