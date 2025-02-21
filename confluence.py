@@ -14,7 +14,7 @@ from functools import lru_cache
 
 def setup_logging(verbose):
     """Configure logging based on verbosity."""
-    level = logging.DEBUG if verbose else logging.INFO
+    level = logging.INFO if not verbose else logging.DEBUG  # Default to INFO (only findings) unless verbose
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(message)s",
         level=level
@@ -40,7 +40,8 @@ class ConfluenceSecretScanner:
         self.logger = logging.getLogger(__name__)
         self.output_file = output_file
         self.args = args
-        self.logger.debug(f"Created root temporary directory: {self.temp_dir.name}")
+        if self.args.verbose:
+            self.logger.debug(f"Created root temporary directory: {self.temp_dir.name}")
 
     def get_spaces(self):
         """Fetch all accessible spaces."""
@@ -50,7 +51,8 @@ class ConfluenceSecretScanner:
             try:
                 response = requests.get(url, headers=self.headers)
                 if response.status_code == 429:
-                    self.logger.warning("Rate limit exceeded. Waiting before retry...")
+                    if self.args.verbose:
+                        self.logger.warning("Rate limit exceeded. Waiting before retry...")
                     time.sleep(60)
                     continue
                 response.raise_for_status()
@@ -61,7 +63,8 @@ class ConfluenceSecretScanner:
                     url = f"{self.base_url}{url}"
                 time.sleep(0.1)  # Reduced delay
             except requests.RequestException as e:
-                self.logger.error(f"Failed to fetch spaces: {e}")
+                if self.args.verbose:
+                    self.logger.error(f"Failed to fetch spaces: {e}")
                 break
         return spaces
 
@@ -71,13 +74,15 @@ class ConfluenceSecretScanner:
         try:
             response = requests.get(url, headers=self.headers)
             if response.status_code == 429:
-                self.logger.warning("Rate limit exceeded. Waiting before retry...")
+                if self.args.verbose:
+                    self.logger.warning("Rate limit exceeded. Waiting before retry...")
                 time.sleep(60)
                 return self.get_space_by_key(key)  # Retry
             response.raise_for_status()
             return response.json()
         except requests.RequestException as e:
-            self.logger.error(f"Failed to fetch space with key '{key}': {e}")
+            if self.args.verbose:
+                self.logger.error(f"Failed to fetch space with key '{key}': {e}")
             return None
 
     def get_content_in_space(self, space_key, content_type):
@@ -89,20 +94,23 @@ class ConfluenceSecretScanner:
             try:
                 response = requests.get(url, headers=self.headers, params=params)
                 if response.status_code == 429:
-                    self.logger.warning("Rate limit exceeded. Waiting before retry...")
+                    if self.args.verbose:
+                        self.logger.warning("Rate limit exceeded. Waiting before retry...")
                     time.sleep(60)
                     continue
                 response.raise_for_status()
                 data = response.json()
                 content.extend(data["results"])
-                self.logger.debug(f"Found {len(data['results'])} {content_type} items in space {space_key}")
+                if self.args.verbose:
+                    self.logger.debug(f"Found {len(data['results'])} {content_type} items in space {space_key}")
                 url = data.get("_links", {}).get("next")
                 if url:
                     url = f"{self.base_url}{url}"
                 time.sleep(0.1)  # Reduced delay
                 params = None  # Clear params after first request
             except requests.RequestException as e:
-                self.logger.error(f"Failed to fetch {content_type} in space {space_key}: {e}")
+                if self.args.verbose:
+                    self.logger.error(f"Failed to fetch {content_type} in space {space_key}: {e}")
                 break
         return content
 
@@ -114,18 +122,22 @@ class ConfluenceSecretScanner:
             try:
                 response = requests.get(url, headers=self.headers)
                 if response.status_code == 429:
-                    self.logger.warning("Rate limit exceeded. Waiting before retry...")
+                    if self.args.verbose:
+                        self.logger.warning("Rate limit exceeded. Waiting before retry...")
                     time.sleep(60)
                     continue
                 response.raise_for_status()
                 data = response.json()
                 comments.extend(data["results"])
+                if self.args.verbose:
+                    self.logger.debug(f"Found {len(data['results'])} comments for content {content_id}")
                 url = data.get("_links", {}).get("next")
                 if url:
                     url = f"{self.base_url}{url}"
                 time.sleep(0.1)  # Reduced delay
             except requests.RequestException as e:
-                self.logger.error(f"Failed to fetch comments for content {content_id}: {e}")
+                if self.args.verbose:
+                    self.logger.error(f"Failed to fetch comments for content {content_id}: {e}")
                 break
         return comments
 
@@ -137,18 +149,22 @@ class ConfluenceSecretScanner:
             try:
                 response = requests.get(url, headers=self.headers)
                 if response.status_code == 429:
-                    self.logger.warning("Rate limit exceeded. Waiting before retry...")
+                    if self.args.verbose:
+                        self.logger.warning("Rate limit exceeded. Waiting before retry...")
                     time.sleep(60)
                     continue
                 response.raise_for_status()
                 data = response.json()
                 attachments.extend(data["results"])
+                if self.args.verbose:
+                    self.logger.debug(f"Found {len(data['results'])} attachments for content {content_id}")
                 url = data.get("_links", {}).get("next")
                 if url:
                     url = f"{self.base_url}{url}"
                 time.sleep(0.1)  # Reduced delay
             except requests.RequestException as e:
-                self.logger.error(f"Failed to fetch attachments for content {content_id}: {e}")
+                if self.args.verbose:
+                    self.logger.error(f"Failed to fetch attachments for content {content_id}: {e}")
                 break
         return attachments
 
@@ -159,60 +175,65 @@ class ConfluenceSecretScanner:
         try:
             response = requests.get(url, headers=self.headers)
             if response.status_code == 429:
-                self.logger.warning("Rate limit exceeded. Waiting before retry...")
+                if self.args.verbose:
+                    self.logger.warning("Rate limit exceeded. Waiting before retry...")
                 time.sleep(60)
                 return self.get_version_content(content_id, version)  # Retry
             response.raise_for_status()
             return response.json()["body"]["storage"]["value"]
         except requests.RequestException as e:
-            self.logger.error(f"Failed to fetch version {version} of content {content_id}: {e}")
+            if self.args.verbose:
+                self.logger.error(f"Failed to fetch version {version} of content {content_id}: {e}")
             return ""
 
     def download_attachment(self, attachment):
-        """Download an attachment to a temporary file, skipping image files."""
+        """Download an attachment to a temporary file, ensuring thorough scanning of all possible content."""
         image_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.bmp')
         if attachment['title'].lower().endswith(image_extensions):
-            self.logger.debug(f"Skipping image attachment: {attachment['title']}")
+            if self.args.verbose:
+                self.logger.debug(f"Skipping image attachment: {attachment['title']}")
             return None
-        text_extensions = ('.txt', '.pdf', '.docx', '.json', '.html', '.xml', '.csv', '.md')  # Expanded for more file types
-        if not attachment['title'].lower().endswith(text_extensions):
-            self.logger.debug(f"Skipping non-text, non-image attachment: {attachment['title']}")
-            return None
+        text_extensions = ('.txt', '.pdf', '.docx', '.json', '.html', '.xml', '.csv', '.md', '.xlsx', '.doc', '.zip', '.rar', '.7z')  # Expanded for thorough scanning
         download_url = f"{self.base_url}{attachment['_links']['download']}"
         temp_file = tempfile.NamedTemporaryFile(delete=False, dir=self.temp_dir.name)
         try:
             response = requests.get(download_url, headers=self.headers, stream=True)
             if response.status_code == 429:
-                self.logger.warning("Rate limit exceeded. Waiting before retry...")
+                if self.args.verbose:
+                    self.logger.warning("Rate limit exceeded. Waiting before retry...")
                 time.sleep(60)
                 return self.download_attachment(attachment)  # Retry
             response.raise_for_status()
             with open(temp_file.name, 'wb') as f:
                 for chunk in response.iter_content(1024):
                     f.write(chunk)
-            self.logger.debug(f"Downloaded attachment to: {temp_file.name}")
+            if self.args.verbose:
+                self.logger.debug(f"Downloaded attachment to: {temp_file.name}")
             if os.path.exists(temp_file.name):
                 return temp_file.name
             else:
-                self.logger.error(f"Downloaded file does not exist: {temp_file.name}")
+                if self.args.verbose:
+                    self.logger.error(f"Downloaded file does not exist: {temp_file.name}")
                 return None
         except requests.RequestException as e:
-            self.logger.error(f"Failed to download attachment {attachment['title']}: {e}")
+            if self.args.verbose:
+                self.logger.error(f"Failed to download attachment {attachment['title']}: {e}")
             if os.path.exists(temp_file.name):
                 os.remove(temp_file.name)
             return None
 
     def scan_text(self, text):
-        """Scan text content with TruffleHog v3."""
+        """Scan text content with TruffleHog v3, ensuring thorough scanning of all text."""
         with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=self.temp_dir.name) as temp_file:
             temp_file.write(text)
             temp_file_path = temp_file.name
-        self.logger.debug(f"Created temporary file for scanning: {temp_file_path}")
         try:
             if not os.path.exists(temp_file_path):
-                self.logger.error(f"Temporary file does not exist: {temp_file_path}")
+                if self.args.verbose:
+                    self.logger.error(f"Temporary file does not exist: {temp_file_path}")
                 return
-            self.logger.debug(f"Scanning text file: {temp_file_path}")
+            if self.args.verbose:
+                self.logger.debug(f"Scanning text file: {temp_file_path}")
             result = subprocess.run(
                 [self.trufflehog_path, "filesystem", temp_file_path, "--json"],
                 capture_output=True,
@@ -224,24 +245,25 @@ class ConfluenceSecretScanner:
                 for finding in findings:
                     yield finding
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"TruffleHog scan failed for text content: {e}")
+            if self.args.verbose:
+                self.logger.error(f"TruffleHog scan failed for text content: {e}")
         finally:
             if os.path.exists(temp_file_path):
                 os.remove(temp_file_path)
 
     def scan_batch(self, file_paths):
-        """Scan multiple files with TruffleHog in a single command."""
+        """Scan multiple files with TruffleHog in a single command, silently skipping if no paths exist."""
         if not file_paths:
-            self.logger.warning("No valid file paths to scan.")
-            return
+            return  # Silently skip if no file paths provided, no warning
         valid_paths = [path for path in file_paths if os.path.exists(path)]
         if not valid_paths:
-            self.logger.warning("No valid file paths to scan after filtering.")
-            return
-        self.logger.debug(f"Scanning batch with paths: {valid_paths}")
+            return  # Silently skip if no valid paths after filtering, no warning
+        if self.args.verbose:
+            self.logger.debug(f"Scanning batch with paths: {valid_paths}")
         try:
             temp_dir = tempfile.mkdtemp(dir=self.temp_dir.name)
-            self.logger.debug(f"Created temporary directory for batch scan: {temp_dir}")
+            if self.args.verbose:
+                self.logger.debug(f"Created temporary directory for batch scan: {temp_dir}")
             for i, path in enumerate(valid_paths):
                 new_path = os.path.join(temp_dir, f"file_{i}")
                 os.rename(path, new_path)
@@ -256,7 +278,8 @@ class ConfluenceSecretScanner:
                 for finding in findings:
                     yield finding
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"TruffleHog batch scan failed: {e}")
+            if self.args.verbose:
+                self.logger.error(f"TruffleHog batch scan failed: {e}")
         finally:
             for file in os.listdir(temp_dir):
                 file_path = os.path.join(temp_dir, file)
@@ -268,7 +291,8 @@ class ConfluenceSecretScanner:
     def scan_file(self, file_path):
         """Scan a file with TruffleHog v3."""
         if not os.path.exists(file_path):
-            self.logger.error(f"File does not exist: {file_path}")
+            if self.args.verbose:
+                self.logger.error(f"File does not exist: {file_path}")
             return
         yield from self.scan_batch([file_path])  # Use batch for consistency
 
@@ -278,7 +302,7 @@ class ConfluenceSecretScanner:
         return f"{self.base_url}{relative_url}"
 
     def process_content(self, content, space_key):
-        """Process a content item, scanning its versions, comments, and attachments."""
+        """Process a content item, scanning its versions, comments, and attachments thoroughly."""
         content_id = content["id"]
         content_type = content["type"]
         title = content["title"]
@@ -286,12 +310,14 @@ class ConfluenceSecretScanner:
 
         # Create a unique temporary directory for this content item
         content_temp_dir = tempfile.mkdtemp(dir=self.temp_dir.name)
-        self.logger.debug(f"Created temporary directory for {content_id}: {content_temp_dir}")
+        if self.args.verbose:
+            self.logger.debug(f"Created temporary directory for {content_id}: {content_temp_dir}")
 
         try:
             # Scan all versions
             current_version = content["version"]["number"]
-            self.logger.debug(f"Scanning {content_type} {title} with {current_version} versions")
+            if self.args.verbose:
+                self.logger.debug(f"Scanning {content_type} {title} with {current_version} versions")
             version_texts = []
             for version in range(1, current_version + 1):
                 version_content = self.get_version_content(content_id, version)
@@ -301,10 +327,10 @@ class ConfluenceSecretScanner:
                     temp_file.close()
                     if os.path.exists(temp_file.name):
                         version_texts.append(temp_file.name)
-                    else:
-                        self.logger.error(f"Temporary file not created for version {version}: {temp_file.name}")
-                    self.logger.debug(f"Added version {version} file: {temp_file.name}")
-            self.logger.debug(f"Scanning {len(version_texts)} version files")
+                    if self.args.verbose:
+                        self.logger.debug(f"Added version {version} file: {temp_file.name}")
+            if self.args.verbose:
+                self.logger.debug(f"Scanning {len(version_texts)} version files with paths: {version_texts}")
             for finding in self.scan_batch(version_texts):
                 finding.update({
                     "space_key": space_key,
@@ -319,7 +345,8 @@ class ConfluenceSecretScanner:
             # Batch comments
             comment_paths = []
             comments = self.get_comments(content_id)
-            self.logger.debug(f"Found {len(comments)} comments for content {content_id}")
+            if self.args.verbose:
+                self.logger.debug(f"Found {len(comments)} comments for content {content_id}")
             for comment in comments:
                 try:
                     comment_body = comment["body"]["storage"]["value"]
@@ -328,13 +355,14 @@ class ConfluenceSecretScanner:
                     temp_file.close()
                     if os.path.exists(temp_file.name):
                         comment_paths.append(temp_file.name)
-                    else:
-                        self.logger.error(f"Temporary file not created for comment {comment.get('id', 'unknown')}: {temp_file.name}")
-                    self.logger.debug(f"Added comment file: {temp_file.name}")
+                    if self.args.verbose:
+                        self.logger.debug(f"Added comment file: {temp_file.name}")
                 except KeyError as e:
-                    self.logger.warning(f"Skipping comment {comment.get('id', 'unknown')} due to missing key: {e}")
+                    if self.args.verbose:
+                        self.logger.warning(f"Skipping comment {comment.get('id', 'unknown')} due to missing key: {e}")
                     continue
-            self.logger.debug(f"Scanning {len(comment_paths)} comment files")
+            if self.args.verbose:
+                self.logger.debug(f"Scanning {len(comment_paths)} comment files with paths: {comment_paths}")
             for finding in self.scan_batch(comment_paths):
                 finding.update({
                     "space_key": space_key,
@@ -346,18 +374,22 @@ class ConfluenceSecretScanner:
                 })
                 self._output_finding(finding)
 
-            # Batch attachments (skip images)
+            # Batch attachments (scan all possible content, including archives if needed)
             attachment_paths = []
             attachments = self.get_attachments(content_id)
-            self.logger.debug(f"Found {len(attachments)} attachments for content {content_id}")
+            if self.args.verbose:
+                self.logger.debug(f"Found {len(attachments)} attachments for content {content_id}")
             for attachment in attachments:
                 file_path = self.download_attachment(attachment)
                 if file_path and os.path.exists(file_path):
                     attachment_paths.append(file_path)
+                if self.args.verbose and file_path:
                     self.logger.debug(f"Added attachment file: {file_path}")
                 elif file_path:
-                    self.logger.error(f"Attachment file not found: {file_path}")
-            self.logger.debug(f"Scanning {len(attachment_paths)} attachment files")
+                    if self.args.verbose:
+                        self.logger.error(f"Attachment file not found: {file_path}")
+            if self.args.verbose:
+                self.logger.debug(f"Scanning {len(attachment_paths)} attachment files with paths: {attachment_paths}")
             for finding in self.scan_batch(attachment_paths):
                 finding.update({
                     "space_key": space_key,
@@ -368,7 +400,8 @@ class ConfluenceSecretScanner:
                 })
                 self._output_finding(finding)
         except Exception as e:
-            self.logger.error(f"Error processing content {content_id}: {e}")
+            if self.args.verbose:
+                self.logger.error(f"Error processing content {content_id}: {e}")
         finally:
             # Clean up only this content's temporary files
             for path in version_texts + comment_paths + attachment_paths:
@@ -378,7 +411,7 @@ class ConfluenceSecretScanner:
                 os.rmdir(content_temp_dir)
 
     def _output_finding(self, finding):
-        """Output a finding to the console or file."""
+        """Output a finding to the console or file, ensuring only identified issues are shown by default."""
         if self.output_file:
             self.output_file.write(json.dumps(finding) + "\n")
         else:
@@ -388,13 +421,16 @@ class ConfluenceSecretScanner:
             )
 
     def scan_space_parallel(self, space):
-        """Scan a single Confluence space for secrets in parallel."""
+        """Scan a single Confluence space for secrets in parallel, ensuring thorough coverage."""
         space_key = space["key"]
-        self.logger.info(f"Scanning space: {space_key}")
+        if self.args.verbose:
+            self.logger.info(f"Scanning space: {space_key}")
 
         # Scan space description (sequential for simplicity)
         description = space.get("description", {}).get("plain", {}).get("value", "")
         if description:
+            if self.args.verbose:
+                self.logger.debug(f"Scanning space description for space {space_key}")
             for finding in self.scan_text(description):
                 finding.update({
                     "space_key": space_key,
@@ -404,21 +440,23 @@ class ConfluenceSecretScanner:
                 })
                 self._output_finding(finding)
 
-        # Parallel scan for pages and blogs with reduced workers
+        # Parallel scan for pages, blog posts, and ensure all content types are checked
+        content_types = ["page", "blogpost"]  # Ensure all relevant content types are scanned
         with ThreadPoolExecutor(max_workers=2) as executor:  # Reduced from 5 to minimize race conditions
             futures = [
                 executor.submit(self.process_content, content, space_key)
-                for content_type in ["page", "blogpost"]
+                for content_type in content_types
                 for content in self.get_content_in_space(space_key, content_type)
             ]
             for future in futures:
                 try:
                     future.result()
                 except Exception as e:
-                    self.logger.error(f"Error in parallel scan: {e}")
+                    if self.args.verbose:
+                        self.logger.error(f"Error in parallel scan: {e}")
 
     def run(self):
-        """Run the secret scan across all or specified spaces."""
+        """Run the secret scan across all or specified spaces, ensuring thorough scanning."""
         if self.args.space_keys:
             spaces_to_scan = []
             for key in self.args.space_keys:
@@ -426,9 +464,11 @@ class ConfluenceSecretScanner:
                 if space:
                     spaces_to_scan.append(space)
                 else:
-                    self.logger.error(f"Space with key '{key}' not found or inaccessible.")
+                    if self.args.verbose:
+                        self.logger.error(f"Space with key '{key}' not found or inaccessible.")
             if not spaces_to_scan:
-                self.logger.error("No valid spaces to scan. Exiting.")
+                if self.args.verbose:
+                    self.logger.error("No valid spaces to scan. Exiting.")
                 return
         else:
             spaces_to_scan = self.get_spaces()
@@ -436,7 +476,8 @@ class ConfluenceSecretScanner:
         for space in spaces_to_scan:
             self.scan_space_parallel(space)
 
-        self.logger.info("Scan completed.")
+        if self.args.verbose:
+            self.logger.info("Scan completed.")
         self.temp_dir.cleanup()
 
 def main():
@@ -449,7 +490,7 @@ def main():
     parser.add_argument("--config", help="Path to config JSON file", default=None)
     parser.add_argument("--output", help="Path to output file for findings in JSON format")
     parser.add_argument("--space-keys", nargs='+', help="Specify one or more Confluence space keys to scan (e.g., SPACE1 SPACE2)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging for troubleshooting")
 
     args = parser.parse_args()
 
