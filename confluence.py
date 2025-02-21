@@ -223,10 +223,12 @@ class ConfluenceSecretScanner:
             return None
 
     def scan_text(self, text):
-        """Scan text content with TruffleHog v3, ensuring thorough scanning of all text."""
+        """Scan text content with TruffleHog v3, excluding PagerDuty detector."""
         with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=self.temp_dir.name) as temp_file:
             temp_file.write(text)
             temp_file_path = temp_file.name
+        if self.args.verbose:
+            self.logger.debug(f"Created temporary file for scanning: {temp_file_path}")
         try:
             if not os.path.exists(temp_file_path):
                 if self.args.verbose:
@@ -235,7 +237,7 @@ class ConfluenceSecretScanner:
             if self.args.verbose:
                 self.logger.debug(f"Scanning text file: {temp_file_path}")
             result = subprocess.run(
-                [self.trufflehog_path, "filesystem", temp_file_path, "--json"],
+                [self.trufflehog_path, "filesystem", temp_file_path, "--json", "--exclude-detectors", "PagerDuty"],
                 capture_output=True,
                 text=True,
                 check=True
@@ -252,7 +254,7 @@ class ConfluenceSecretScanner:
                 os.remove(temp_file_path)
 
     def scan_batch(self, file_paths):
-        """Scan multiple files with TruffleHog in a single command, silently skipping if no paths exist."""
+        """Scan multiple files with TruffleHog in a single command, excluding PagerDuty detector, silently skipping if no paths exist."""
         if not file_paths:
             return  # Silently skip if no file paths provided, no warning
         valid_paths = [path for path in file_paths if os.path.exists(path)]
@@ -268,7 +270,7 @@ class ConfluenceSecretScanner:
                 new_path = os.path.join(temp_dir, f"file_{i}")
                 os.rename(path, new_path)
             result = subprocess.run(
-                [self.trufflehog_path, "filesystem", temp_dir, "--json"],
+                [self.trufflehog_path, "filesystem", temp_dir, "--json", "--exclude-detectors", "PagerDuty"],
                 capture_output=True,
                 text=True,
                 check=True
@@ -289,7 +291,7 @@ class ConfluenceSecretScanner:
                 os.rmdir(temp_dir)
 
     def scan_file(self, file_path):
-        """Scan a file with TruffleHog v3."""
+        """Scan a file with TruffleHog v3, excluding PagerDuty detector."""
         if not os.path.exists(file_path):
             if self.args.verbose:
                 self.logger.error(f"File does not exist: {file_path}")
