@@ -503,4 +503,24 @@ def main():
     if args.config:
         config = load_config(args.config)
 
-    token = args.token or config
+    token = args.token or config.get("token") or os.getenv("CONFLUENCE_USER_TOKEN")
+    url = args.url or config.get("url")
+    trufflehog_path = args.trufflehog_path or config.get("trufflehog_path", "trufflehog")
+
+    if not token:
+        logging.error("Confluence token is required. Set via --token, config file, or CONFLUENCE_USER_TOKEN env var.")
+        return
+    if not url:
+        logging.error("Confluence URL is required. Set via --url or config file.")
+        return
+
+    if args.output:
+        with open(args.output, "w") as output_file:
+            scanner = ConfluenceSecretScanner(token, url, trufflehog_path, output_file, args)
+            scanner.run()
+    else:
+        scanner = ConfluenceSecretScanner(token, url, trufflehog_path, args=args)
+        scanner.run()
+
+if __name__ == "__main__":
+    main()
