@@ -9,6 +9,8 @@ import requests
 import tempfile
 import time
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 
 def setup_logging(verbose):
     """Configure logging based on verbosity."""
@@ -46,13 +48,17 @@ class ConfluenceSecretScanner:
         while url:
             try:
                 response = requests.get(url, headers=self.headers)
+                if response.status_code == 429:
+                    self.logger.warning("Rate limit exceeded. Waiting before retry...")
+                    time.sleep(60)
+                    continue
                 response.raise_for_status()
                 data = response.json()
                 spaces.extend(data["results"])
                 url = data.get("_links", {}).get("next")
                 if url:
                     url = f"{self.base_url}{url}"
-                time.sleep(0.5)  # Add delay to avoid rate limits
+                time.sleep(0.1)  # Reduced delay
             except requests.RequestException as e:
                 self.logger.error(f"Failed to fetch spaces: {e}")
                 break
@@ -63,6 +69,10 @@ class ConfluenceSecretScanner:
         url = f"{self.base_url}/rest/api/space/{key}"
         try:
             response = requests.get(url, headers=self.headers)
+            if response.status_code == 429:
+                self.logger.warning("Rate limit exceeded. Waiting before retry...")
+                time.sleep(60)
+                return self.get_space_by_key(key)  # Retry
             response.raise_for_status()
             return response.json()
         except requests.RequestException as e:
@@ -77,13 +87,17 @@ class ConfluenceSecretScanner:
         while url:
             try:
                 response = requests.get(url, headers=self.headers, params=params)
+                if response.status_code == 429:
+                    self.logger.warning("Rate limit exceeded. Waiting before retry...")
+                    time.sleep(60)
+                    continue
                 response.raise_for_status()
                 data = response.json()
                 content.extend(data["results"])
                 url = data.get("_links", {}).get("next")
                 if url:
                     url = f"{self.base_url}{url}"
-                time.sleep(0.5)  # Add delay to avoid rate limits
+                time.sleep(0.1)  # Reduced delay
                 params = None  # Clear params after first request
             except requests.RequestException as e:
                 self.logger.error(f"Failed to fetch {content_type} in space {space_key}: {e}")
@@ -97,13 +111,17 @@ class ConfluenceSecretScanner:
         while url:
             try:
                 response = requests.get(url, headers=self.headers)
+                if response.status_code == 429:
+                    self.logger.warning("Rate limit exceeded. Waiting before retry...")
+                    time.sleep(60)
+                    continue
                 response.raise_for_status()
                 data = response.json()
                 comments.extend(data["results"])
                 url = data.get("_links", {}).get("next")
                 if url:
                     url = f"{self.base_url}{url}"
-                time.sleep(0.5)  # Add delay to avoid rate limits
+                time.sleep(0.1)  # Reduced delay
             except requests.RequestException as e:
                 self.logger.error(f"Failed to fetch comments for content {content_id}: {e}")
                 break
@@ -116,23 +134,32 @@ class ConfluenceSecretScanner:
         while url:
             try:
                 response = requests.get(url, headers=self.headers)
+                if response.status_code == 429:
+                    self.logger.warning("Rate limit exceeded. Waiting before retry...")
+                    time.sleep(60)
+                    continue
                 response.raise_for_status()
                 data = response.json()
                 attachments.extend(data["results"])
                 url = data.get("_links", {}).get("next")
                 if url:
                     url = f"{self.base_url}{url}"
-                time.sleep(0.5)  # Add delay to avoid rate limits
+                time.sleep(0.1)  # Reduced delay
             except requests.RequestException as e:
                 self.logger.error(f"Failed to fetch attachments for content {content_id}: {e}")
                 break
         return attachments
 
+    @lru_cache(maxsize=100)
     def get_version_content(self, content_id, version):
         """Fetch the content of a specific version of a page or blog post."""
         url = f"{self.base_url}/rest/api/content/{content_id}?version={version}&expand=body.storage"
         try:
             response = requests.get(url, headers=self.headers)
+            if response.status_code == 429:
+                self.logger.warning("Rate limit exceeded. Waiting before retry...")
+                time.sleep(60)
+                return self.get_version_content(content_id, version)  # Retry
             response.raise_for_status()
             return response.json()["body"]["storage"]["value"]
         except requests.RequestException as e:
@@ -141,13 +168,14 @@ class ConfluenceSecretScanner:
 
     def download_attachment(self, attachment):
         """Download an attachment to a temporary file."""
-        if not attachment['title'].endswith(('.txt', '.pdf', '.docx', '.json')):
-            self.logger.debug(f"Skipping non-text attachment: {attachment['title']}")
-            return None
         download_url = f"{self.base_url}{attachment['_links']['download']}"
         temp_file = tempfile.NamedTemporaryFile(delete=False, dir=self.temp_dir.name)
         try:
             response = requests.get(download_url, headers=self.headers, stream=True)
+            if response.status_code == 429:
+                self.logger.warning("Rate limit exceeded. Waiting before retry...")
+                time.sleep(60)
+                return self.download_attachment(attachment)  # Retry
             response.raise_for_status()
             with open(temp_file.name, 'wb') as f:
                 for chunk in response.iter_content(1024):
@@ -179,11 +207,17 @@ class ConfluenceSecretScanner:
         finally:
             os.remove(temp_file_path)
 
-    def scan_file(self, file_path):
-        """Scan a file with TruffleHog v3."""
+    def scan_batch(self, file_paths):
+        """Scan multiple files with TruffleHog in a single command."""
+        if not file_paths:
+            return
         try:
+            temp_dir = tempfile.mkdtemp(dir=self.temp_dir.name)
+            for i, path in enumerate(file_paths):
+                new_path = os.path.join(temp_dir, f"file_{i}")
+                os.rename(path, new_path)
             result = subprocess.run(
-                [self.trufflehog_path, "filesystem", file_path, "--json"],
+                [self.trufflehog_path, "filesystem", temp_dir, "--json"],
                 capture_output=True,
                 text=True,
                 check=True
@@ -193,7 +227,15 @@ class ConfluenceSecretScanner:
                 for finding in findings:
                     yield finding
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"TruffleHog scan failed for file {file_path}: {e}")
+            self.logger.error(f"TruffleHog batch scan failed: {e}")
+        finally:
+            for file in os.listdir(temp_dir):
+                os.remove(os.path.join(temp_dir, file))
+            os.rmdir(temp_dir)
+
+    def scan_file(self, file_path):
+        """Scan a file with TruffleHog v3."""
+        yield from self.scan_batch([file_path])  # Use batch for consistency
 
     def get_content_url(self, content):
         """Get the full URL of a content item (page or blog post)."""
@@ -210,54 +252,60 @@ class ConfluenceSecretScanner:
         # Scan all versions
         current_version = content["version"]["number"]
         self.logger.debug(f"Scanning {content_type} {title} with {current_version} versions")
+        version_texts = []
         for version in range(1, current_version + 1):
             version_content = self.get_version_content(content_id, version)
             if version_content:
-                for finding in self.scan_text(version_content):
-                    finding.update({
-                        "space_key": space_key,
-                        "content_type": content_type,
-                        "content_id": content_id,
-                        "version": version,
-                        "title": title,
-                        "url": url
-                    })
-                    self._output_finding(finding)
+                version_texts.append(version_content)
+        for finding in self.scan_batch([tempfile.NamedTemporaryFile(mode='w', delete=False, dir=self.temp_dir.name).name for _ in version_texts]):
+            finding.update({
+                "space_key": space_key,
+                "content_type": content_type,
+                "content_id": content_id,
+                "version": version,
+                "title": title,
+                "url": url
+            })
+            self._output_finding(finding)
 
-        # Scan comments with error handling for missing 'body'
+        # Batch comments
+        comment_texts = []
         comments = self.get_comments(content_id)
         for comment in comments:
             try:
                 comment_body = comment["body"]["storage"]["value"]
+                comment_texts.append(comment_body)
             except KeyError as e:
                 self.logger.warning(f"Skipping comment {comment.get('id', 'unknown')} due to missing key: {e}")
                 continue
-            for finding in self.scan_text(comment_body):
-                finding.update({
-                    "space_key": space_key,
-                    "content_type": "comment",
-                    "content_id": comment["id"],
-                    "parent_content_id": content_id,
-                    "title": f"Comment on {title}",
-                    "url": url
-                })
-                self._output_finding(finding)
+        for finding in self.scan_batch([tempfile.NamedTemporaryFile(mode='w', delete=False, dir=self.temp_dir.name).name for _ in comment_texts]):
+            finding.update({
+                "space_key": space_key,
+                "content_type": "comment",
+                "content_id": comment["id"],
+                "parent_content_id": content_id,
+                "title": f"Comment on {title}",
+                "url": url
+            })
+            self._output_finding(finding)
 
-        # Scan attachments
-        attachments = self.get_attachments(content_id)
-        for attachment in attachments:
+        # Batch attachments
+        attachment_paths = []
+        for attachment in self.get_attachments(content_id):
             file_path = self.download_attachment(attachment)
             if file_path:
-                for finding in self.scan_file(file_path):
-                    finding.update({
-                        "space_key": space_key,
-                        "content_type": "attachment",
-                        "attachment_id": attachment["id"],
-                        "title": attachment["title"],
-                        "url": url
-                    })
-                    self._output_finding(finding)
-                os.remove(file_path)
+                attachment_paths.append(file_path)
+        for finding in self.scan_batch(attachment_paths):
+            finding.update({
+                "space_key": space_key,
+                "content_type": "attachment",
+                "attachment_id": attachment["id"],
+                "title": attachment["title"],
+                "url": url
+            })
+            self._output_finding(finding)
+        for path in attachment_paths:
+            os.remove(path)
 
     def _output_finding(self, finding):
         """Output a finding to the console or file."""
@@ -269,12 +317,12 @@ class ConfluenceSecretScanner:
                 f"in {finding['content_type']} '{finding['title']}' at {finding['url']}"
             )
 
-    def scan_space(self, space):
-        """Scan a single Confluence space for secrets."""
+    def scan_space_parallel(self, space):
+        """Scan a single Confluence space for secrets in parallel."""
         space_key = space["key"]
         self.logger.info(f"Scanning space: {space_key}")
 
-        # Scan space description
+        # Scan space description (sequential for simplicity)
         description = space.get("description", {}).get("plain", {}).get("value", "")
         if description:
             for finding in self.scan_text(description):
@@ -286,15 +334,18 @@ class ConfluenceSecretScanner:
                 })
                 self._output_finding(finding)
 
-        # Scan pages
-        pages = self.get_content_in_space(space_key, "page")
-        for page in pages:
-            self.process_content(page, space_key)
-
-        # Scan blog posts
-        blogs = self.get_content_in_space(space_key, "blogpost")
-        for blog in blogs:
-            self.process_content(blog, space_key)
+        # Parallel scan for pages and blogs
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [
+                executor.submit(self.process_content, content, space_key)
+                for content_type in ["page", "blogpost"]
+                for content in self.get_content_in_space(space_key, content_type)
+            ]
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as e:
+                    self.logger.error(f"Error in parallel scan: {e}")
 
     def run(self):
         """Run the secret scan across all or specified spaces."""
@@ -313,7 +364,7 @@ class ConfluenceSecretScanner:
             spaces_to_scan = self.get_spaces()
 
         for space in spaces_to_scan:
-            self.scan_space(space)
+            self.scan_space_parallel(space)
 
         self.logger.info("Scan completed.")
         self.temp_dir.cleanup()
