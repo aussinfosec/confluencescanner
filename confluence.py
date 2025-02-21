@@ -40,6 +40,7 @@ class ConfluenceSecretScanner:
         self.logger = logging.getLogger(__name__)
         self.output_file = output_file
         self.args = args
+        self.logger.debug(f"Created root temporary directory: {self.temp_dir.name}")
 
     def get_spaces(self):
         """Fetch all accessible spaces."""
@@ -188,10 +189,12 @@ class ConfluenceSecretScanner:
             with open(temp_file.name, 'wb') as f:
                 for chunk in response.iter_content(1024):
                     f.write(chunk)
+            self.logger.debug(f"Downloaded attachment to: {temp_file.name}")
             return temp_file.name
         except requests.RequestException as e:
             self.logger.error(f"Failed to download attachment {attachment['title']}: {e}")
-            os.remove(temp_file.name)
+            if os.path.exists(temp_file.name):
+                os.remove(temp_file.name)
             return None
 
     def scan_text(self, text):
@@ -199,6 +202,7 @@ class ConfluenceSecretScanner:
         with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=self.temp_dir.name) as temp_file:
             temp_file.write(text)
             temp_file_path = temp_file.name
+        self.logger.debug(f"Created temporary file for scanning: {temp_file_path}")
         try:
             result = subprocess.run(
                 [self.trufflehog_path, "filesystem", temp_file_path, "--json"],
@@ -213,18 +217,22 @@ class ConfluenceSecretScanner:
         except subprocess.CalledProcessError as e:
             self.logger.error(f"TruffleHog scan failed for text content: {e}")
         finally:
-            os.remove(temp_file_path)
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
 
     def scan_batch(self, file_paths):
         """Scan multiple files with TruffleHog in a single command."""
         if not file_paths:
+            self.logger.warning("No valid file paths to scan.")
             return
         valid_paths = [path for path in file_paths if os.path.exists(path)]
         if not valid_paths:
-            self.logger.warning("No valid file paths to scan.")
+            self.logger.warning("No valid file paths to scan after filtering.")
             return
+        self.logger.debug(f"Scanning batch with paths: {valid_paths}")
         try:
             temp_dir = tempfile.mkdtemp(dir=self.temp_dir.name)
+            self.logger.debug(f"Created temporary directory for batch scan: {temp_dir}")
             for i, path in enumerate(valid_paths):
                 new_path = os.path.join(temp_dir, f"file_{i}")
                 os.rename(path, new_path)
@@ -242,8 +250,11 @@ class ConfluenceSecretScanner:
             self.logger.error(f"TruffleHog batch scan failed: {e}")
         finally:
             for file in os.listdir(temp_dir):
-                os.remove(os.path.join(temp_dir, file))
-            os.rmdir(temp_dir)
+                file_path = os.path.join(temp_dir, file)
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            if os.path.exists(temp_dir):
+                os.rmdir(temp_dir)
 
     def scan_file(self, file_path):
         """Scan a file with TruffleHog v3."""
@@ -261,73 +272,81 @@ class ConfluenceSecretScanner:
         title = content["title"]
         url = self.get_content_url(content)
 
-        # Scan all versions
-        current_version = content["version"]["number"]
-        self.logger.debug(f"Scanning {content_type} {title} with {current_version} versions")
-        version_texts = []
-        for version in range(1, current_version + 1):
-            version_content = self.get_version_content(content_id, version)
-            if version_content:
-                temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, dir=self.temp_dir.name)
-                temp_file.write(version_content)
-                temp_file.close()
-                version_texts.append(temp_file.name)
-        for finding in self.scan_batch(version_texts):
-            finding.update({
-                "space_key": space_key,
-                "content_type": content_type,
-                "content_id": content_id,
-                "version": version,
-                "title": title,
-                "url": url
-            })
-            self._output_finding(finding)
-        for path in version_texts:
-            os.remove(path)
+        # Create a unique temporary directory for this content item
+        content_temp_dir = tempfile.mkdtemp(dir=self.temp_dir.name)
+        self.logger.debug(f"Created temporary directory for {content_id}: {content_temp_dir}")
 
-        # Batch comments
-        comment_paths = []
-        comments = self.get_comments(content_id)
-        for comment in comments:
-            try:
-                comment_body = comment["body"]["storage"]["value"]
-                temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, dir=self.temp_dir.name)
-                temp_file.write(comment_body)
-                temp_file.close()
-                comment_paths.append(temp_file.name)
-            except KeyError as e:
-                self.logger.warning(f"Skipping comment {comment.get('id', 'unknown')} due to missing key: {e}")
-                continue
-        for finding in self.scan_batch(comment_paths):
-            finding.update({
-                "space_key": space_key,
-                "content_type": "comment",
-                "content_id": comment["id"],
-                "parent_content_id": content_id,
-                "title": f"Comment on {title}",
-                "url": url
-            })
-            self._output_finding(finding)
-        for path in comment_paths:
-            os.remove(path)
+        try:
+            # Scan all versions
+            current_version = content["version"]["number"]
+            self.logger.debug(f"Scanning {content_type} {title} with {current_version} versions")
+            version_texts = []
+            for version in range(1, current_version + 1):
+                version_content = self.get_version_content(content_id, version)
+                if version_content:
+                    temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, dir=content_temp_dir)
+                    temp_file.write(version_content)
+                    temp_file.close()
+                    version_texts.append(temp_file.name)
+            for finding in self.scan_batch(version_texts):
+                finding.update({
+                    "space_key": space_key,
+                    "content_type": content_type,
+                    "content_id": content_id,
+                    "version": version,
+                    "title": title,
+                    "url": url
+                })
+                self._output_finding(finding)
 
-        # Batch attachments (skip images)
-        attachment_paths = []
-        for attachment in self.get_attachments(content_id):
-            file_path = self.download_attachment(attachment)
-            if file_path:
-                attachment_paths.append(file_path)
-        for finding in self.scan_batch(attachment_paths):
-            finding.update({
-                "space_key": space_key,
-                "content_type": "attachment",
-                "attachment_id": attachment["id"],
-                "title": attachment["title"],
-                "url": url
-            })
-            self._output_finding(finding)
-        for path in attachment_paths:
-            os.remove(path)
+            # Batch comments
+            comment_paths = []
+            comments = self.get_comments(content_id)
+            for comment in comments:
+                try:
+                    comment_body = comment["body"]["storage"]["value"]
+                    temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, dir=content_temp_dir)
+                    temp_file.write(comment_body)
+                    temp_file.close()
+                    comment_paths.append(temp_file.name)
+                except KeyError as e:
+                    self.logger.warning(f"Skipping comment {comment.get('id', 'unknown')} due to missing key: {e}")
+                    continue
+            for finding in self.scan_batch(comment_paths):
+                finding.update({
+                    "space_key": space_key,
+                    "content_type": "comment",
+                    "content_id": comment["id"],
+                    "parent_content_id": content_id,
+                    "title": f"Comment on {title}",
+                    "url": url
+                })
+                self._output_finding(finding)
+
+            # Batch attachments (skip images)
+            attachment_paths = []
+            for attachment in self.get_attachments(content_id):
+                file_path = self.download_attachment(attachment)
+                if file_path and os.path.exists(file_path):
+                    attachment_paths.append(file_path)
+            for finding in self.scan_batch(attachment_paths):
+                finding.update({
+                    "space_key": space_key,
+                    "content_type": "attachment",
+                    "attachment_id": attachment["id"],
+                    "title": attachment["title"],
+                    "url": url
+                })
+                self._output_finding(finding)
+        except Exception as e:
+            self.logger.error(f"Error processing content {content_id}: {e}")
+        finally:
+            # Clean up only this content's temporary files
+            for path in version_texts + comment_paths + attachment_paths:
+                if os.path.exists(path):
+                    os.remove(path)
+            if os.path.exists(content_temp_dir):
+                os.rmdir(content_temp_dir)
 
     def _output_finding(self, finding):
         """Output a finding to the console or file."""
@@ -356,8 +375,8 @@ class ConfluenceSecretScanner:
                 })
                 self._output_finding(finding)
 
-        # Parallel scan for pages and blogs
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        # Parallel scan for pages and blogs with reduced workers
+        with ThreadPoolExecutor(max_workers=2) as executor:  # Reduced from 5 to minimize race conditions
             futures = [
                 executor.submit(self.process_content, content, space_key)
                 for content_type in ["page", "blogpost"]
