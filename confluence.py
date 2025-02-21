@@ -95,6 +95,7 @@ class ConfluenceSecretScanner:
                 response.raise_for_status()
                 data = response.json()
                 content.extend(data["results"])
+                self.logger.debug(f"Found {len(data['results'])} {content_type} items in space {space_key}")
                 url = data.get("_links", {}).get("next")
                 if url:
                     url = f"{self.base_url}{url}"
@@ -173,7 +174,7 @@ class ConfluenceSecretScanner:
         if attachment['title'].lower().endswith(image_extensions):
             self.logger.debug(f"Skipping image attachment: {attachment['title']}")
             return None
-        text_extensions = ('.txt', '.pdf', '.docx', '.json', '.html', '.xml')
+        text_extensions = ('.txt', '.pdf', '.docx', '.json', '.html', '.xml', '.csv', '.md')  # Expanded for more file types
         if not attachment['title'].lower().endswith(text_extensions):
             self.logger.debug(f"Skipping non-text, non-image attachment: {attachment['title']}")
             return None
@@ -190,7 +191,11 @@ class ConfluenceSecretScanner:
                 for chunk in response.iter_content(1024):
                     f.write(chunk)
             self.logger.debug(f"Downloaded attachment to: {temp_file.name}")
-            return temp_file.name
+            if os.path.exists(temp_file.name):
+                return temp_file.name
+            else:
+                self.logger.error(f"Downloaded file does not exist: {temp_file.name}")
+                return None
         except requests.RequestException as e:
             self.logger.error(f"Failed to download attachment {attachment['title']}: {e}")
             if os.path.exists(temp_file.name):
@@ -204,6 +209,10 @@ class ConfluenceSecretScanner:
             temp_file_path = temp_file.name
         self.logger.debug(f"Created temporary file for scanning: {temp_file_path}")
         try:
+            if not os.path.exists(temp_file_path):
+                self.logger.error(f"Temporary file does not exist: {temp_file_path}")
+                return
+            self.logger.debug(f"Scanning text file: {temp_file_path}")
             result = subprocess.run(
                 [self.trufflehog_path, "filesystem", temp_file_path, "--json"],
                 capture_output=True,
@@ -258,6 +267,9 @@ class ConfluenceSecretScanner:
 
     def scan_file(self, file_path):
         """Scan a file with TruffleHog v3."""
+        if not os.path.exists(file_path):
+            self.logger.error(f"File does not exist: {file_path}")
+            return
         yield from self.scan_batch([file_path])  # Use batch for consistency
 
     def get_content_url(self, content):
@@ -287,7 +299,12 @@ class ConfluenceSecretScanner:
                     temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, dir=content_temp_dir)
                     temp_file.write(version_content)
                     temp_file.close()
-                    version_texts.append(temp_file.name)
+                    if os.path.exists(temp_file.name):
+                        version_texts.append(temp_file.name)
+                    else:
+                        self.logger.error(f"Temporary file not created for version {version}: {temp_file.name}")
+                    self.logger.debug(f"Added version {version} file: {temp_file.name}")
+            self.logger.debug(f"Scanning {len(version_texts)} version files")
             for finding in self.scan_batch(version_texts):
                 finding.update({
                     "space_key": space_key,
@@ -302,16 +319,22 @@ class ConfluenceSecretScanner:
             # Batch comments
             comment_paths = []
             comments = self.get_comments(content_id)
+            self.logger.debug(f"Found {len(comments)} comments for content {content_id}")
             for comment in comments:
                 try:
                     comment_body = comment["body"]["storage"]["value"]
                     temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, dir=content_temp_dir)
                     temp_file.write(comment_body)
                     temp_file.close()
-                    comment_paths.append(temp_file.name)
+                    if os.path.exists(temp_file.name):
+                        comment_paths.append(temp_file.name)
+                    else:
+                        self.logger.error(f"Temporary file not created for comment {comment.get('id', 'unknown')}: {temp_file.name}")
+                    self.logger.debug(f"Added comment file: {temp_file.name}")
                 except KeyError as e:
                     self.logger.warning(f"Skipping comment {comment.get('id', 'unknown')} due to missing key: {e}")
                     continue
+            self.logger.debug(f"Scanning {len(comment_paths)} comment files")
             for finding in self.scan_batch(comment_paths):
                 finding.update({
                     "space_key": space_key,
@@ -325,10 +348,16 @@ class ConfluenceSecretScanner:
 
             # Batch attachments (skip images)
             attachment_paths = []
-            for attachment in self.get_attachments(content_id):
+            attachments = self.get_attachments(content_id)
+            self.logger.debug(f"Found {len(attachments)} attachments for content {content_id}")
+            for attachment in attachments:
                 file_path = self.download_attachment(attachment)
                 if file_path and os.path.exists(file_path):
                     attachment_paths.append(file_path)
+                    self.logger.debug(f"Added attachment file: {file_path}")
+                elif file_path:
+                    self.logger.error(f"Attachment file not found: {file_path}")
+            self.logger.debug(f"Scanning {len(attachment_paths)} attachment files")
             for finding in self.scan_batch(attachment_paths):
                 finding.update({
                     "space_key": space_key,
