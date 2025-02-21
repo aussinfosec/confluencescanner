@@ -167,7 +167,15 @@ class ConfluenceSecretScanner:
             return ""
 
     def download_attachment(self, attachment):
-        """Download an attachment to a temporary file."""
+        """Download an attachment to a temporary file, skipping image files."""
+        image_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.bmp')
+        if attachment['title'].lower().endswith(image_extensions):
+            self.logger.debug(f"Skipping image attachment: {attachment['title']}")
+            return None
+        text_extensions = ('.txt', '.pdf', '.docx', '.json', '.html', '.xml')
+        if not attachment['title'].lower().endswith(text_extensions):
+            self.logger.debug(f"Skipping non-text, non-image attachment: {attachment['title']}")
+            return None
         download_url = f"{self.base_url}{attachment['_links']['download']}"
         temp_file = tempfile.NamedTemporaryFile(delete=False, dir=self.temp_dir.name)
         try:
@@ -211,9 +219,13 @@ class ConfluenceSecretScanner:
         """Scan multiple files with TruffleHog in a single command."""
         if not file_paths:
             return
+        valid_paths = [path for path in file_paths if os.path.exists(path)]
+        if not valid_paths:
+            self.logger.warning("No valid file paths to scan.")
+            return
         try:
             temp_dir = tempfile.mkdtemp(dir=self.temp_dir.name)
-            for i, path in enumerate(file_paths):
+            for i, path in enumerate(valid_paths):
                 new_path = os.path.join(temp_dir, f"file_{i}")
                 os.rename(path, new_path)
             result = subprocess.run(
@@ -256,8 +268,11 @@ class ConfluenceSecretScanner:
         for version in range(1, current_version + 1):
             version_content = self.get_version_content(content_id, version)
             if version_content:
-                version_texts.append(version_content)
-        for finding in self.scan_batch([tempfile.NamedTemporaryFile(mode='w', delete=False, dir=self.temp_dir.name).name for _ in version_texts]):
+                temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, dir=self.temp_dir.name)
+                temp_file.write(version_content)
+                temp_file.close()
+                version_texts.append(temp_file.name)
+        for finding in self.scan_batch(version_texts):
             finding.update({
                 "space_key": space_key,
                 "content_type": content_type,
@@ -267,18 +282,23 @@ class ConfluenceSecretScanner:
                 "url": url
             })
             self._output_finding(finding)
+        for path in version_texts:
+            os.remove(path)
 
         # Batch comments
-        comment_texts = []
+        comment_paths = []
         comments = self.get_comments(content_id)
         for comment in comments:
             try:
                 comment_body = comment["body"]["storage"]["value"]
-                comment_texts.append(comment_body)
+                temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, dir=self.temp_dir.name)
+                temp_file.write(comment_body)
+                temp_file.close()
+                comment_paths.append(temp_file.name)
             except KeyError as e:
                 self.logger.warning(f"Skipping comment {comment.get('id', 'unknown')} due to missing key: {e}")
                 continue
-        for finding in self.scan_batch([tempfile.NamedTemporaryFile(mode='w', delete=False, dir=self.temp_dir.name).name for _ in comment_texts]):
+        for finding in self.scan_batch(comment_paths):
             finding.update({
                 "space_key": space_key,
                 "content_type": "comment",
@@ -288,8 +308,10 @@ class ConfluenceSecretScanner:
                 "url": url
             })
             self._output_finding(finding)
+        for path in comment_paths:
+            os.remove(path)
 
-        # Batch attachments
+        # Batch attachments (skip images)
         attachment_paths = []
         for attachment in self.get_attachments(content_id):
             file_path = self.download_attachment(attachment)
