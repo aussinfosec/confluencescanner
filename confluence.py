@@ -29,6 +29,23 @@ def load_config(config_path):
         logging.error(f"Failed to load config file {config_path}: {e}")
         return {}
 
+def get_text_snippet(text, secret, context_length=50):
+    """Extract a snippet of text surrounding the secret for context."""
+    if not text or not secret:
+        return "N/A"
+    secret_start = text.find(secret)
+    if secret_start == -1:
+        return "N/A"
+    
+    start = max(0, secret_start - context_length)
+    end = min(len(text), secret_start + len(secret) + context_length)
+    snippet = text[start:end]
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(text):
+        snippet = snippet + "..."
+    return snippet.replace("\n", " ").strip()
+
 class ConfluenceSecretScanner:
     def __init__(self, token, base_url, trufflehog_path="trufflehog", output_file=None, args=None):
         """Initialize the Confluence secret scanner."""
@@ -222,8 +239,8 @@ class ConfluenceSecretScanner:
                 os.remove(temp_file.name)
             return None
 
-    def scan_text(self, text):
-        """Scan text content with TruffleHog v3, excluding PagerDutyApiKey detector."""
+    def scan_text(self, text, content_type, metadata=None):
+        """Scan text content with TruffleHog v3, excluding PagerDutyApiKey detector, and yield findings with context."""
         with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=self.temp_dir.name) as temp_file:
             temp_file.write(text)
             temp_file_path = temp_file.name
@@ -245,6 +262,10 @@ class ConfluenceSecretScanner:
             if result.stdout:
                 findings = [json.loads(line) for line in result.stdout.strip().splitlines()]
                 for finding in findings:
+                    finding["content_type"] = content_type
+                    finding["snippet"] = get_text_snippet(text, finding["Raw"])
+                    if metadata:
+                        finding.update(metadata)
                     yield finding
         except subprocess.CalledProcessError as e:
             if self.args.verbose:
@@ -253,7 +274,7 @@ class ConfluenceSecretScanner:
             if os.path.exists(temp_file_path):
                 os.remove(temp_file_path)
 
-    def scan_batch(self, file_paths):
+    def scan_batch(self, file_paths, content_type, metadata=None):
         """Scan multiple files with TruffleHog in a single command, excluding PagerDutyApiKey detector, silently skipping if no paths exist."""
         if not file_paths:
             return  # Silently skip if no file paths provided, no warning
@@ -278,6 +299,11 @@ class ConfluenceSecretScanner:
             if result.stdout:
                 findings = [json.loads(line) for line in result.stdout.strip().splitlines()]
                 for finding in findings:
+                    finding["content_type"] = content_type
+                    # For batch scans (e.g., attachments), we don't have direct access to the text content here
+                    finding["snippet"] = "N/A"  # Snippets are not available for batch scans
+                    if metadata:
+                        finding.update(metadata)
                     yield finding
         except subprocess.CalledProcessError as e:
             if self.args.verbose:
@@ -290,27 +316,25 @@ class ConfluenceSecretScanner:
             if os.path.exists(temp_dir):
                 os.rmdir(temp_dir)
 
-    def scan_file(self, file_path):
+    def scan_file(self, file_path, content_type, metadata=None):
         """Scan a file with TruffleHog v3, excluding PagerDutyApiKey detector."""
         if not os.path.exists(file_path):
             if self.args.verbose:
                 self.logger.error(f"File does not exist: {file_path}")
             return
-        yield from self.scan_batch([file_path])  # Use batch for consistency
+        yield from self.scan_batch([file_path], content_type, metadata)
 
-    def get_content_url(self, content, version=None):
-        """Get the full URL of a content item (page or blog post), optionally for a specific version."""
+    def get_content_url(self, content):
+        """Get the full URL of a content item (page or blog post)."""
         relative_url = content["_links"]["webui"]
-        base_url = f"{self.base_url}{relative_url}"
-        if version is not None:
-            return f"{base_url}?focusedVersion={version}"
-        return base_url
+        return f"{self.base_url}{relative_url}"
 
     def process_content(self, content, space_key):
         """Process a content item, scanning its versions, comments, and attachments thoroughly."""
         content_id = content["id"]
         content_type = content["type"]
         title = content["title"]
+        base_url = self.get_content_url(content)
 
         # Track findings to avoid duplicates
         seen_findings = set()
@@ -331,7 +355,6 @@ class ConfluenceSecretScanner:
             version_texts = []
             for version in range(1, current_version + 1):
                 version_content = self.get_version_content(content_id, version)
-                version_url = self.get_content_url(content, version=version)
                 if version_content:
                     temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, dir=content_temp_dir)
                     temp_file.write(version_content)
@@ -342,15 +365,18 @@ class ConfluenceSecretScanner:
                         self.logger.debug(f"Added version {version} file: {temp_file.name}")
                 if self.args.verbose:
                     self.logger.debug(f"Scanning {len(version_texts)} version files with paths: {version_texts}")
-                for finding in self.scan_batch(version_texts):
-                    finding.update({
+                for finding in self.scan_text(
+                    version_content,
+                    content_type="page",
+                    metadata={
                         "space_key": space_key,
-                        "content_type": content_type,
                         "content_id": content_id,
                         "version": version,
                         "title": title,
-                        "url": version_url  # Use version-specific URL
-                    })
+                        "url": base_url,
+                        "location": f"page content (version {version})"
+                    }
+                ):
                     self._output_finding(finding)
 
             # Batch comments
@@ -361,6 +387,7 @@ class ConfluenceSecretScanner:
             for comment in comments:
                 try:
                     comment_body = comment["body"]["storage"]["value"]
+                    comment_id = comment["id"]
                     temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, dir=content_temp_dir)
                     temp_file.write(comment_body)
                     temp_file.close()
@@ -368,23 +395,23 @@ class ConfluenceSecretScanner:
                         comment_paths.append(temp_file.name)
                     if self.args.verbose:
                         self.logger.debug(f"Added comment file: {temp_file.name}")
+                    for finding in self.scan_text(
+                        comment_body,
+                        content_type="comment",
+                        metadata={
+                            "space_key": space_key,
+                            "content_id": comment_id,
+                            "parent_content_id": content_id,
+                            "title": f"Comment on {title}",
+                            "url": base_url,
+                            "location": f"comment (ID: {comment_id})"
+                        }
+                    ):
+                        self._output_finding(finding)
                 except KeyError as e:
                     if self.args.verbose:
                         self.logger.warning(f"Skipping comment {comment.get('id', 'unknown')} due to missing key: {e}")
                     continue
-            if self.args.verbose:
-                self.logger.debug(f"Scanning {len(comment_paths)} comment files with paths: {comment_paths}")
-            latest_url = self.get_content_url(content)  # Use the latest version URL for comments
-            for finding in self.scan_batch(comment_paths):
-                finding.update({
-                    "space_key": space_key,
-                    "content_type": "comment",
-                    "content_id": comment["id"],
-                    "parent_content_id": content_id,
-                    "title": f"Comment on {title}",
-                    "url": latest_url
-                })
-                self._output_finding(finding)
 
             # Batch attachments with deduplication and unchanged version skipping
             attachment_paths = []
@@ -393,6 +420,7 @@ class ConfluenceSecretScanner:
                 self.logger.debug(f"Found {len(attachments)} attachments for content {content_id}")
             for attachment in attachments:
                 attachment_id = attachment["id"]
+                attachment_title = attachment["title"]
                 current_version = attachment["version"]["number"]
                 if attachment_id in attachment_versions:
                     if attachment_versions[attachment_id] == current_version:
@@ -410,8 +438,17 @@ class ConfluenceSecretScanner:
                         self.logger.error(f"Attachment file not found: {file_path}")
             if self.args.verbose:
                 self.logger.debug(f"Scanning {len(attachment_paths)} attachment files with paths: {attachment_paths}")
-            for finding in self.scan_batch(attachment_paths):
-                attachment_id = attachment["id"]
+            for finding in self.scan_batch(
+                attachment_paths,
+                content_type="attachment",
+                metadata={
+                    "space_key": space_key,
+                    "attachment_id": attachment_id,
+                    "title": attachment_title,
+                    "url": base_url,
+                    "location": f"attachment '{attachment_title}' (ID: {attachment_id})"
+                }
+            ):
                 # Create a unique key for deduplication: attachment ID + raw finding
                 finding_key = (attachment_id, finding["Raw"])
                 if finding_key in seen_findings:
@@ -419,13 +456,6 @@ class ConfluenceSecretScanner:
                         self.logger.debug(f"Skipping duplicate finding for attachment {attachment_id}: {finding['Raw']}")
                     continue
                 seen_findings.add(finding_key)
-                finding.update({
-                    "space_key": space_key,
-                    "content_type": "attachment",
-                    "attachment_id": attachment_id,
-                    "title": attachment["title"],
-                    "url": latest_url  # Use the latest version URL for attachments
-                })
                 self._output_finding(finding)
         except Exception as e:
             if self.args.verbose:
@@ -443,7 +473,8 @@ class ConfluenceSecretScanner:
         version_info = f" (version {finding.get('version', 'N/A')})" if 'version' in finding else ""
         log_message = (
             f"Found {finding['DetectorName']}: {finding['Raw']} (Verified: {finding['Verified']}) "
-            f"in {finding['content_type']} '{finding['title']}'{version_info} at {finding['url']}"
+            f"in {finding['content_type']} '{finding['title']}'{version_info} at {finding['url']} "
+            f"[Location: {finding['location']}, Snippet: {finding['snippet']}]"
         )
         if self.output_file:
             self.output_file.write(json.dumps(finding) + "\n")
@@ -461,13 +492,16 @@ class ConfluenceSecretScanner:
         if description:
             if self.args.verbose:
                 self.logger.debug(f"Scanning space description for space {space_key}")
-            for finding in self.scan_text(description):
-                finding.update({
+            for finding in self.scan_text(
+                description,
+                content_type="space_description",
+                metadata={
                     "space_key": space_key,
-                    "content_type": "space_description",
                     "title": f"Description of space {space_key}",
-                    "url": f"{self.base_url}/spaces/{space_key}"
-                })
+                    "url": f"{self.base_url}/spaces/{space_key}",
+                    "location": "space description"
+                }
+            ):
                 self._output_finding(finding)
 
         # Parallel scan for pages, blog posts, and ensure all content types are checked
