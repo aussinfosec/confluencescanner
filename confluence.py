@@ -193,7 +193,7 @@ class ConfluenceSecretScanner:
             if self.args.verbose:
                 self.logger.debug(f"Skipping image attachment: {attachment['title']}")
             return None
-        text_extensions = ('.txt', '.pdf', '.docx', '.json', '.html', '.xml', '.csv', '.md', '.xlsx', '.doc', '.zip', '.rar', '.7z')  # Expanded for thorough scanning
+        text_extensions = ('.txt', '.pdf', '.docx', '.json', '.html', '.xml', '.csv', '.md', '.xlsx', '.doc', '.zip', '.rar', '.7z')
         download_url = f"{self.base_url}{attachment['_links']['download']}"
         temp_file = tempfile.NamedTemporaryFile(delete=False, dir=self.temp_dir.name)
         try:
@@ -298,17 +298,25 @@ class ConfluenceSecretScanner:
             return
         yield from self.scan_batch([file_path])  # Use batch for consistency
 
-    def get_content_url(self, content):
-        """Get the full URL of a content item (page or blog post)."""
+    def get_content_url(self, content, version=None):
+        """Get the full URL of a content item (page or blog post), optionally for a specific version."""
         relative_url = content["_links"]["webui"]
-        return f"{self.base_url}{relative_url}"
+        base_url = f"{self.base_url}{relative_url}"
+        if version is not None:
+            return f"{base_url}?focusedVersion={version}"
+        return base_url
 
     def process_content(self, content, space_key):
         """Process a content item, scanning its versions, comments, and attachments thoroughly."""
         content_id = content["id"]
         content_type = content["type"]
         title = content["title"]
-        url = self.get_content_url(content)
+
+        # Track findings to avoid duplicates
+        seen_findings = set()
+
+        # Track the latest version of each attachment
+        attachment_versions = {}
 
         # Create a unique temporary directory for this content item
         content_temp_dir = tempfile.mkdtemp(dir=self.temp_dir.name)
@@ -323,6 +331,7 @@ class ConfluenceSecretScanner:
             version_texts = []
             for version in range(1, current_version + 1):
                 version_content = self.get_version_content(content_id, version)
+                version_url = self.get_content_url(content, version=version)
                 if version_content:
                     temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, dir=content_temp_dir)
                     temp_file.write(version_content)
@@ -331,18 +340,18 @@ class ConfluenceSecretScanner:
                         version_texts.append(temp_file.name)
                     if self.args.verbose:
                         self.logger.debug(f"Added version {version} file: {temp_file.name}")
-            if self.args.verbose:
-                self.logger.debug(f"Scanning {len(version_texts)} version files with paths: {version_texts}")
-            for finding in self.scan_batch(version_texts):
-                finding.update({
-                    "space_key": space_key,
-                    "content_type": content_type,
-                    "content_id": content_id,
-                    "version": version,
-                    "title": title,
-                    "url": url
-                })
-                self._output_finding(finding)
+                if self.args.verbose:
+                    self.logger.debug(f"Scanning {len(version_texts)} version files with paths: {version_texts}")
+                for finding in self.scan_batch(version_texts):
+                    finding.update({
+                        "space_key": space_key,
+                        "content_type": content_type,
+                        "content_id": content_id,
+                        "version": version,
+                        "title": title,
+                        "url": version_url  # Use version-specific URL
+                    })
+                    self._output_finding(finding)
 
             # Batch comments
             comment_paths = []
@@ -365,6 +374,7 @@ class ConfluenceSecretScanner:
                     continue
             if self.args.verbose:
                 self.logger.debug(f"Scanning {len(comment_paths)} comment files with paths: {comment_paths}")
+            latest_url = self.get_content_url(content)  # Use the latest version URL for comments
             for finding in self.scan_batch(comment_paths):
                 finding.update({
                     "space_key": space_key,
@@ -372,16 +382,24 @@ class ConfluenceSecretScanner:
                     "content_id": comment["id"],
                     "parent_content_id": content_id,
                     "title": f"Comment on {title}",
-                    "url": url
+                    "url": latest_url
                 })
                 self._output_finding(finding)
 
-            # Batch attachments (scan all possible content, including archives if needed)
+            # Batch attachments with deduplication and unchanged version skipping
             attachment_paths = []
             attachments = self.get_attachments(content_id)
             if self.args.verbose:
                 self.logger.debug(f"Found {len(attachments)} attachments for content {content_id}")
             for attachment in attachments:
+                attachment_id = attachment["id"]
+                current_version = attachment["version"]["number"]
+                if attachment_id in attachment_versions:
+                    if attachment_versions[attachment_id] == current_version:
+                        if self.args.verbose:
+                            self.logger.debug(f"Skipping unchanged attachment {attachment_id} (version {current_version})")
+                        continue
+                attachment_versions[attachment_id] = current_version
                 file_path = self.download_attachment(attachment)
                 if file_path and os.path.exists(file_path):
                     attachment_paths.append(file_path)
@@ -393,12 +411,20 @@ class ConfluenceSecretScanner:
             if self.args.verbose:
                 self.logger.debug(f"Scanning {len(attachment_paths)} attachment files with paths: {attachment_paths}")
             for finding in self.scan_batch(attachment_paths):
+                attachment_id = attachment["id"]
+                # Create a unique key for deduplication: attachment ID + raw finding
+                finding_key = (attachment_id, finding["Raw"])
+                if finding_key in seen_findings:
+                    if self.args.verbose:
+                        self.logger.debug(f"Skipping duplicate finding for attachment {attachment_id}: {finding['Raw']}")
+                    continue
+                seen_findings.add(finding_key)
                 finding.update({
                     "space_key": space_key,
                     "content_type": "attachment",
-                    "attachment_id": attachment["id"],
+                    "attachment_id": attachment_id,
                     "title": attachment["title"],
-                    "url": url
+                    "url": latest_url  # Use the latest version URL for attachments
                 })
                 self._output_finding(finding)
         except Exception as e:
@@ -414,13 +440,15 @@ class ConfluenceSecretScanner:
 
     def _output_finding(self, finding):
         """Output a finding to the console or file, ensuring only identified issues are shown by default."""
+        version_info = f" (version {finding.get('version', 'N/A')})" if 'version' in finding else ""
+        log_message = (
+            f"Found {finding['DetectorName']}: {finding['Raw']} (Verified: {finding['Verified']}) "
+            f"in {finding['content_type']} '{finding['title']}'{version_info} at {finding['url']}"
+        )
         if self.output_file:
             self.output_file.write(json.dumps(finding) + "\n")
         else:
-            self.logger.info(
-                f"Found {finding['DetectorName']}: {finding['Raw']} (Verified: {finding['Verified']}) "
-                f"in {finding['content_type']} '{finding['title']}' at {finding['url']}"
-            )
+            self.logger.info(log_message)
 
     def scan_space_parallel(self, space):
         """Scan a single Confluence space for secrets in parallel, ensuring thorough coverage."""
